@@ -16,9 +16,12 @@ import urllib.request
 from pathlib import Path
 from xml.etree import ElementTree
 
+from pypdf import PdfReader
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PAPERS_DIR = REPO_ROOT / "papers"
+PDFS_DIR = REPO_ROOT / "pdfs"
 TODAY = dt.datetime.now(dt.timezone(dt.timedelta(hours=8))).date()
 
 TOP_VENUES = [
@@ -65,6 +68,25 @@ def paper_url(paper: dict) -> str:
     return ""
 
 
+def pdf_url(paper: dict) -> str:
+    open_access_pdf = paper.get("openAccessPdf") or {}
+    if open_access_pdf.get("url"):
+        return open_access_pdf["url"]
+
+    external_ids = paper.get("externalIds") or {}
+    if external_ids.get("ArXiv"):
+        return f"https://arxiv.org/pdf/{external_ids['ArXiv']}"
+
+    url = paper.get("url") or ""
+    arxiv_match = re.search(r"arxiv\.org/abs/([^?#]+)", url)
+    if arxiv_match:
+        return f"https://arxiv.org/pdf/{arxiv_match.group(1)}"
+
+    if url.endswith(".pdf"):
+        return url
+    return ""
+
+
 def existing_notes_text() -> str:
     if not PAPERS_DIR.exists():
         return ""
@@ -83,6 +105,8 @@ def score_paper(paper: dict, seen_text: str) -> float:
     venue = venue_name(paper)
     combined = f"{title} {abstract}".lower()
     if not title or not abstract:
+        return -1
+    if not pdf_url(paper):
         return -1
     if title.lower() in seen_text.lower() or paper_url(paper) in seen_text:
         return -1
@@ -172,14 +196,54 @@ def search_arxiv_fallback(seen_text: str) -> list[dict]:
                 "year": TODAY.year,
                 "citationCount": 0,
                 "url": url_text,
+                "openAccessPdf": {"url": url_text.replace("/abs/", "/pdf/")},
             }
         )
     return papers
 
 
-def fallback_summaries(abstract: str) -> dict[str, str]:
-    sentences = re.split(r"(?<=[.!?])\s+", abstract)
-    english = " ".join(sentences[:3]).strip() or abstract[:800]
+def download_pdf(url: str, path: Path) -> bool:
+    headers = {"User-Agent": "master-papers-daily-bot/1.0"}
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as response:
+            content_type = response.headers.get("Content-Type", "")
+            data = response.read()
+    except (urllib.error.URLError, TimeoutError) as exc:
+        print(f"PDF download failed for {url}: {exc}", file=sys.stderr)
+        return False
+
+    if not data.startswith(b"%PDF") and "pdf" not in content_type.lower():
+        print(f"Downloaded content does not look like a PDF: {url}", file=sys.stderr)
+        return False
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    return True
+
+
+def extract_pdf_text(path: Path, max_chars: int = 24000) -> str:
+    try:
+        reader = PdfReader(str(path))
+    except Exception as exc:
+        print(f"PDF read failed for {path}: {exc}", file=sys.stderr)
+        return ""
+
+    parts = []
+    for page in reader.pages[:12]:
+        try:
+            parts.append(page.extract_text() or "")
+        except Exception as exc:
+            print(f"PDF page text extraction failed: {exc}", file=sys.stderr)
+            continue
+        if len("\n".join(parts)) >= max_chars:
+            break
+    return normalize("\n".join(parts))[:max_chars]
+
+
+def fallback_summaries(source_text: str) -> dict[str, str]:
+    sentences = re.split(r"(?<=[.!?])\s+", source_text)
+    english = " ".join(sentences[:4]).strip() or source_text[:1000]
     zh_tw = (
         "未設定 OPENAI_API_KEY，因此此處先保留可讀的摘要重點："
         + english
@@ -187,10 +251,10 @@ def fallback_summaries(abstract: str) -> dict[str, str]:
     return {"english_summary": english, "zh_tw_summary": zh_tw}
 
 
-def openai_summaries(title: str, abstract: str) -> dict[str, str]:
+def openai_summaries(title: str, source_text: str) -> dict[str, str]:
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
-        return fallback_summaries(abstract)
+        return fallback_summaries(source_text)
 
     model = os.environ.get("OPENAI_MODEL") or "gpt-5-mini"
     prompt = textwrap.dedent(
@@ -204,7 +268,7 @@ def openai_summaries(title: str, abstract: str) -> dict[str, str]:
         - Mention the core problem, method, and why it matters.
 
         Title: {title}
-        Abstract: {abstract}
+        Paper text: {source_text}
         """
     ).strip()
 
@@ -228,7 +292,7 @@ def openai_summaries(title: str, abstract: str) -> dict[str, str]:
             data = json.loads(response.read().decode("utf-8"))
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
         print(f"OpenAI summary failed: {exc}", file=sys.stderr)
-        return fallback_summaries(abstract)
+        return fallback_summaries(source_text)
 
     output_text = data.get("output_text")
     if not output_text:
@@ -242,11 +306,11 @@ def openai_summaries(title: str, abstract: str) -> dict[str, str]:
     try:
         parsed = json.loads(output_text)
     except (TypeError, json.JSONDecodeError):
-        return fallback_summaries(abstract)
+        return fallback_summaries(source_text)
 
     return {
-        "english_summary": normalize(parsed.get("english_summary")) or fallback_summaries(abstract)["english_summary"],
-        "zh_tw_summary": normalize(parsed.get("zh_tw_summary")) or fallback_summaries(abstract)["zh_tw_summary"],
+        "english_summary": normalize(parsed.get("english_summary")) or fallback_summaries(source_text)["english_summary"],
+        "zh_tw_summary": normalize(parsed.get("zh_tw_summary")) or fallback_summaries(source_text)["zh_tw_summary"],
     }
 
 
@@ -255,13 +319,14 @@ def slugify(title: str) -> str:
     return slug[:80] or "paper"
 
 
-def markdown_for(paper: dict) -> str:
+def markdown_for(paper: dict, markdown_path: Path, pdf_path: Path, source_text: str) -> str:
     title = normalize(paper.get("title"))
     abstract = normalize(paper.get("abstract"))
     venue = venue_name(paper) or "Unknown"
     year = paper.get("year") or "Unknown"
     url = paper_url(paper) or "Unknown"
-    summaries = openai_summaries(title, abstract)
+    pdf_link = os.path.relpath(pdf_path, start=markdown_path.parent)
+    summaries = openai_summaries(title, source_text or abstract)
 
     return textwrap.dedent(
         f"""\
@@ -275,6 +340,7 @@ def markdown_for(paper: dict) -> str:
         # {title}
 
         - Paper link: {url}
+        - Local PDF: [{pdf_path.name}]({pdf_link})
         - Venue: {venue}
         - Year: {year}
 
@@ -304,20 +370,32 @@ def main() -> int:
         print("No candidate paper found.", file=sys.stderr)
         return 1
 
-    paper = candidates[existing_note_count() % len(candidates)]
     month_dir = PAPERS_DIR / TODAY.strftime("%Y-%m")
+    pdf_month_dir = PDFS_DIR / TODAY.strftime("%Y-%m")
     month_dir.mkdir(parents=True, exist_ok=True)
-    path = month_dir / f"{TODAY.isoformat()}-{slugify(normalize(paper.get('title')))}.md"
 
-    if path.exists():
-        print(f"Today's note already exists: {path}")
+    start_index = existing_note_count() % len(candidates)
+    ordered_candidates = candidates[start_index:] + candidates[:start_index]
+    for paper in ordered_candidates:
+        slug = slugify(normalize(paper.get("title")))
+        path = month_dir / f"{TODAY.isoformat()}-{slug}.md"
+        pdf_path = pdf_month_dir / f"{TODAY.isoformat()}-{slug}.pdf"
+
+        if path.exists():
+            print(f"Today's note already exists: {path}")
+            return 0
+
+        if not download_pdf(pdf_url(paper), pdf_path):
+            continue
+
+        source_text = extract_pdf_text(pdf_path) or normalize(paper.get("abstract"))
+        path.write_text(markdown_for(paper, path, pdf_path, source_text), encoding="utf-8")
+        print(f"Generated {path.relative_to(REPO_ROOT)} and {pdf_path.relative_to(REPO_ROOT)}")
         return 0
 
-    path.write_text(markdown_for(paper), encoding="utf-8")
-    print(f"Generated {path.relative_to(REPO_ROOT)}")
-    return 0
+    print("No candidate paper PDF could be downloaded.", file=sys.stderr)
+    return 1
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
