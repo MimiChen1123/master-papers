@@ -9,7 +9,7 @@ This repository is updated by a Codex daily automation. Each run adds:
 
 ## Paper Selection
 
-The script searches for recommender-system papers and prioritizes venues in this order:
+The Codex automation searches for recommender-system papers and prioritizes venues in this order:
 
 1. NeurIPS
 2. ICML
